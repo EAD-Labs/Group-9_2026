@@ -9,7 +9,7 @@
  * Start button), so anonymous visitors can't burn the owner's Tavus credits.
  */
 
-import { integration } from 'deepspace'
+import { getAuthToken, integration } from 'deepspace'
 import type { Difficulty, InterviewType } from '../types'
 
 /**
@@ -90,6 +90,21 @@ interface TavusResult<T> {
   success: boolean
   data?: T
   error?: string
+}
+
+/** Call our same-origin, server-only Tavus gateway. */
+async function tavusPost<T>(operation: string, body: Record<string, unknown>): Promise<TavusResult<T>> {
+  const token = await getAuthToken()
+  const response = await fetch(`/api/tavus/${encodeURIComponent(operation)}`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  return (await response.json()) as TavusResult<T>
 }
 
 function unwrap<T>(result: TavusResult<T>, what: string): T {
@@ -259,10 +274,10 @@ export async function generateCodingProblem(
 
 /** Fetch a short list of stock interviewers (avatars) for the picker. */
 export async function fetchInterviewers(limit = 8): Promise<InterviewerOption[]> {
-  const res = (await integration.post('tavus/list-replicas', {
+  const res = await tavusPost<{ data?: Array<Record<string, unknown>> }>('list-replicas', {
     replica_type: 'system',
     limit: 60,
-  })) as TavusResult<{ data?: Array<Record<string, unknown>> }>
+  })
   if (!res.success) return []
   const replicas = res.data?.data ?? []
   return replicas
@@ -293,9 +308,7 @@ interface Replica {
  */
 async function findStockReplicaId(): Promise<string> {
   const tryList = async (body: Record<string, unknown>): Promise<string | undefined> => {
-    const res = (await integration.post('tavus/list-replicas', body)) as TavusResult<{
-      data?: Replica[]
-    }>
+    const res = await tavusPost<{ data?: Replica[] }>('list-replicas', body)
     if (!res.success) return undefined
     const replicas = res.data?.data ?? []
     const ready = replicas.find((r) => r.status === 'completed' || r.status === 'ready')
@@ -343,18 +356,35 @@ export async function startConversation(opts: StartConversationOpts): Promise<St
       : undefined
 
   const persona = unwrap(
-    (await integration.post('tavus/create-persona', {
+    await tavusPost<{ persona_id: string }>('create-persona', {
       persona_name: `${role} interviewer`,
       pipeline_mode: 'full',
       system_prompt: buildSystemPrompt(role, interviewType, { difficulty, problem }, jobDescription),
       context: jobDescription?.trim() || undefined,
       default_replica_id: replicaId,
-    })) as TavusResult<{ persona_id: string }>,
+      // Raven produces an end-of-call observation that the scoring job turns
+      // into neutral, actionable coaching. It is deliberately limited to
+      // observable camera and delivery signals — never personality or traits.
+      layers: {
+        perception: {
+          perception_model: 'raven-1',
+          visual_awareness_queries: [
+            'Is the candidate consistently visible and generally oriented toward the conversation camera?',
+            'Are there sustained periods of looking away from the conversation or visible disengagement?',
+            'Is the candidate posture generally attentive and interview-appropriate?',
+          ],
+          audio_awareness_queries: [
+            'Does the candidate delivery include frequent long pauses, filler-heavy speech, or rushed pacing?',
+            'Does the candidate vocal delivery generally sound clear and steady?',
+          ],
+        },
+      },
+    }),
     'create-persona',
   )
 
   const conversation = unwrap(
-    (await integration.post('tavus/create-conversation', {
+    await tavusPost<{ conversation_id: string; conversation_url: string }>('create-conversation', {
       replica_id: replicaId,
       persona_id: persona.persona_id,
       conversation_name: `${role} mock interview`,
@@ -369,7 +399,7 @@ export async function startConversation(opts: StartConversationOpts): Promise<St
         participant_left_timeout: 120,
         participant_absent_timeout: 300,
       },
-    })) as TavusResult<{ conversation_id: string; conversation_url: string }>,
+    }),
     'create-conversation',
   )
 
@@ -392,9 +422,9 @@ export async function getConversationState(
   conversationId: string,
 ): Promise<'active' | 'ended' | 'unknown'> {
   try {
-    const res = (await integration.post('tavus/get-conversation', {
+    const res = await tavusPost<{ status?: string }>('get-conversation', {
       conversation_id: conversationId,
-    })) as TavusResult<{ status?: string }>
+    })
     if (!res.success) return 'unknown'
     const status = res.data?.status?.toLowerCase()
     if (!status) return 'unknown'
@@ -408,7 +438,7 @@ export async function getConversationState(
 /** End the live avatar session. Best-effort — never throws to the caller. */
 export async function endConversation(conversationId: string): Promise<void> {
   try {
-    await integration.post('tavus/end-conversation', { conversation_id: conversationId })
+    await tavusPost('end-conversation', { conversation_id: conversationId })
   } catch (err) {
     console.warn('[tavus] end-conversation failed (ignored):', err)
   }
