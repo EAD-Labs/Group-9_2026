@@ -28,7 +28,7 @@ interface ScorePayload {
 
 // Gemini Flash keeps both phases quick and affordable while the report is
 // generated in the durable server-side job (the browser never sees the key).
-const REPORT_MODEL = 'gemini-2.5-flash'
+const REPORT_MODEL = 'gemini-3.6-flash'
 
 // ── transcript polling ──────────────────────────────────────────────────────
 
