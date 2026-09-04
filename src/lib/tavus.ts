@@ -9,7 +9,7 @@
  * Start button), so anonymous visitors can't burn the owner's Tavus credits.
  */
 
-import { getAuthToken, integration } from 'deepspace'
+import { getAuthToken } from 'deepspace'
 import type { Difficulty, InterviewType } from '../types'
 
 /**
@@ -23,42 +23,6 @@ export const CALL_LIMIT_MINUTES: Record<InterviewType, number> = {
   coding: 45,
   'system-design': 45,
 }
-
-// Problem generation calibrates difficulty + topic, so use the stronger model
-// (one call at provision time — quality matters more than the extra second).
-const PROBLEM_MODEL = 'claude-sonnet-4-6'
-
-/** Map our level to an explicit LeetCode difficulty tier for the problem. */
-const LEETCODE_TIER: Record<Difficulty, string> = {
-  intern: 'LeetCode EASY to lower-MEDIUM. One straightforward data structure; clean, direct logic.',
-  junior: 'LeetCode MEDIUM. One non-obvious insight or data-structure choice.',
-  mid: 'LeetCode HARD (a strong MEDIUM-HARD at the very easiest). A real algorithmic insight required.',
-  senior:
-    'LeetCode HARD. Requires the optimal approach and edge-case rigor.',
-  staff:
-    'LeetCode HARD, often multi-part or deliberately ambiguous. Requires the optimal approach and deep trade-off reasoning.',
-}
-
-/** Canonical interview patterns — we pick one at random for variety. */
-const PROBLEM_PATTERNS = [
-  'arrays & hashing',
-  'two pointers',
-  'sliding window',
-  'stack',
-  'binary search',
-  'linked lists',
-  'trees & BFS/DFS',
-  'graphs',
-  'heaps / priority queue',
-  'intervals',
-  'greedy',
-  'dynamic programming',
-  'backtracking',
-  'tries',
-  'matrix traversal',
-  'string manipulation',
-  'data-structure design (e.g. LRU cache)',
-]
 
 export interface CodingProblem {
   title: string
@@ -96,6 +60,21 @@ interface TavusResult<T> {
 async function tavusPost<T>(operation: string, body: Record<string, unknown>): Promise<TavusResult<T>> {
   const token = await getAuthToken()
   const response = await fetch(`/api/tavus/${encodeURIComponent(operation)}`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  return (await response.json()) as TavusResult<T>
+}
+
+/** Call the server-side Gemini gateway; credentials stay in the Worker. */
+async function geminiPost<T>(path: string, body: Record<string, unknown>): Promise<TavusResult<T>> {
+  const token = await getAuthToken()
+  const response = await fetch(`/api/gemini/${encodeURIComponent(path)}`, {
     method: 'POST',
     credentials: 'include',
     headers: {
@@ -206,70 +185,20 @@ export function buildGreeting(role: string, interviewType: InterviewType): strin
   return `Hi, thanks for joining. I'll be your interviewer today for the ${role} role. Let's get started — ${opener}`
 }
 
-/** Robust-ish JSON extraction from a model reply (handles ```json fences). */
-function parseJson(text: string): Record<string, unknown> {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
-  const body = fenced ? fenced[1] : text
-  const start = body.indexOf('{')
-  const end = body.lastIndexOf('}')
-  if (start === -1 || end === -1) throw new Error('Problem generator returned no JSON.')
-  return JSON.parse(body.slice(start, end + 1))
-}
-
 /**
  * Pre-generate a coding problem (+ progressive hints) so we can both show it
- * on screen and hand the interviewer the exact same problem. Owner-billed via
- * the anthropic integration; only reached from the signed-in live page.
- *
- * The problem is authored by Claude from its knowledge of the standard
- * LeetCode-style interview bank — calibrated to an explicit difficulty TIER,
- * a topic matched to the role/JD, and a randomly chosen pattern so repeat
- * sessions don't get the same question. (There's no live LeetCode API; Claude's
- * training knowledge is the source.)
+ * on screen and hand the interviewer the exact same problem. Gemini runs in
+ * the server-side Worker, so no provider credential reaches the browser.
  */
 export async function generateCodingProblem(
   role: string,
   difficulty: Difficulty,
   jobDescription?: string,
 ): Promise<CodingProblem> {
-  // Random pattern + nonce → variety across sessions (browser Math.random).
-  const focus = PROBLEM_PATTERNS[Math.floor(Math.random() * PROBLEM_PATTERNS.length)]
-  const nonce = Math.random().toString(36).slice(2, 8)
-
-  const system = [
-    `You are an interview problem-setter writing ONE coding question for a "${role}" candidate, in the exact style of a real LeetCode / big-tech phone-screen problem.`,
-    `DIFFICULTY — calibrate precisely to: ${LEETCODE_TIER[difficulty]}`,
-    `TOPIC — match it to the role and job description. Bias toward the pattern "${focus}" unless a different pattern clearly fits this role better. For data/analytics roles where the JD implies SQL, a SQL query problem is acceptable instead.`,
-    jobDescription?.trim()
-      ? `Tailor the framing/flavor to this job description:\n${jobDescription.trim()}`
-      : 'No job description provided — pick a broadly relevant topic for the role.',
-    'Base it on a canonical interview-problem archetype you know from the standard bank, but write a CLEAN, self-contained, original statement in your own words — do NOT just cite a famous problem by name.',
-    'The statement MUST include: a precise task, 1-2 worked examples with explicit input AND output, and constraints (input sizes / value ranges). It should be solvable in ~20-30 minutes at the target difficulty.',
-    'In each example give ONLY the final correct output and a brief, clean explanation — never show your own reasoning, second-guessing, or corrections (no "actually…", no scratch work).',
-    'Return ONLY a JSON object: { "title": short string, "statement": string (plain text; use \\n for line breaks), "hints": [exactly 3 progressive hints from a gentle nudge to nearly the full approach, each one short sentence] }.',
-  ]
-    .filter(Boolean)
-    .join('\n')
-
-  const res = (await integration.post('anthropic/chat-completion', {
-    model: PROBLEM_MODEL,
-    max_tokens: 1500,
-    system,
-    messages: [
-      { role: 'user', content: `Generate the problem now. Make it a fresh variation (variety key: ${nonce}).` },
-    ],
-  })) as TavusResult<{ content?: Array<{ text?: string }> }>
-  const data = unwrap(res, 'generate-problem')
-  const text = data.content?.[0]?.text ?? ''
-  const parsed = parseJson(text)
-  const hints = Array.isArray(parsed.hints)
-    ? parsed.hints.filter((h): h is string => typeof h === 'string')
-    : []
-  return {
-    title: typeof parsed.title === 'string' ? parsed.title : 'Coding problem',
-    statement: typeof parsed.statement === 'string' ? parsed.statement : text.trim(),
-    hints,
-  }
+  return unwrap(
+    await geminiPost<CodingProblem>('coding-problem', { role, difficulty, jobDescription }),
+    'generate coding problem',
+  )
 }
 
 /** Fetch a short list of stock interviewers (avatars) for the picker. */
