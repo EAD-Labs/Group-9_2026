@@ -1,4 +1,4 @@
-name = "mock-interview"
+name = "dialogue-interview-neel"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 main = "worker.ts"
@@ -35,8 +35,8 @@ bindings = [
 #   docs/proposals/binding-auto-provisioning.md
 
 [vars]
-DEEPSPACE_APP_ID = "mock-interview"
-APP_NAME = "mock-interview"
+DEEPSPACE_APP_ID = "app_01M1GCVCAHVQW1PKV5VGKBN1CS"
+APP_NAME = "dialogue-interview-neel"
 
 [dev]
 port = 8780

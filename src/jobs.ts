@@ -5,7 +5,7 @@
  * the avatar call and turns a finished Tavus conversation into a scored report:
  *
  *   1. poll `tavus/get-conversation` until the transcript is ready
- *   2. send the transcript to the `anthropic` integration to score each answer
+ *   2. send the transcript to Gemini to score each answer
  *   3. write the `reports` row and flip the interview to status = 'scored'
  *
  * Progress is broadcast over the JobRoom WebSocket (`ctx.progress`) so the
@@ -14,9 +14,10 @@
  */
 
 import { generateText } from 'ai'
-import { createDeepSpaceAI, apiWorkerFetch } from 'deepspace/worker'
+import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import type { Job, JobContext } from 'deepspace/worker'
 import type { Env } from '../worker'
+import { callTavus } from './lib/tavus-server'
 import { EXPECTED_QUESTIONS } from './types'
 import type { InterviewType, PerQuestionScore, Report, TranscriptTurn } from './types'
 
@@ -25,10 +26,9 @@ interface ScorePayload {
   conversationId: string
 }
 
-// Two-phase scoring: a fast model for the instant summary, a stronger model
-// for the slow, detailed per-question breakdown.
-const QUICK_MODEL = 'claude-haiku-4-5'
-const DETAIL_MODEL = 'claude-sonnet-4-6'
+// Gemini Flash keeps both phases quick and affordable while the report is
+// generated in the durable server-side job (the browser never sees the key).
+const REPORT_MODEL = 'gemini-2.5-flash'
 
 // ── transcript polling ──────────────────────────────────────────────────────
 
@@ -43,22 +43,6 @@ const sleep = (ms: number, signal?: AbortSignal) =>
       reject(new Error('aborted'))
     })
   })
-
-/** Owner-billed integration call from worker context (mirrors cron's helper). */
-async function callIntegration<T>(env: Env, endpoint: string, params: unknown): Promise<T> {
-  if (!env.APP_OWNER_JWT) throw new Error('APP_OWNER_JWT not configured')
-  const res = await apiWorkerFetch(env, `/api/integrations/${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.APP_OWNER_JWT}` },
-    body: JSON.stringify(params),
-  })
-  const text = await res.text()
-  const body = text ? JSON.parse(text) : {}
-  if (!res.ok || !body.success) {
-    throw new Error(body.error || body.message || `Integration ${endpoint} failed (HTTP ${res.status})`)
-  }
-  return body.data as T
-}
 
 /**
  * Tavus returns transcript turns in a few shapes depending on API version
@@ -97,6 +81,21 @@ function collectRawTurns(conv: Record<string, unknown>): Array<Record<string, un
   return []
 }
 
+/** Raven emits this end-of-call event after its audio/video analysis completes. */
+function extractPerceptionAnalysis(conversation: unknown): string | undefined {
+  const conv = conversation as Record<string, unknown>
+  if (!Array.isArray(conv.events)) return undefined
+  for (const event of [...(conv.events as Array<Record<string, unknown>>) ].reverse()) {
+    const type = String(event.event_type ?? event.type ?? '').toLowerCase()
+    if (!type.includes('perception')) continue
+    const props = (event.properties ?? event.data ?? {}) as Record<string, unknown>
+    const analysis = props.analysis ?? props.perception_analysis
+    if (typeof analysis === 'string' && analysis.trim()) return analysis.trim()
+    if (Array.isArray(analysis)) return analysis.map(String).filter(Boolean).join('\n') || undefined
+  }
+  return undefined
+}
+
 /** A candidate turn only "counts" once it carries some real content. */
 const MIN_ANSWER_CHARS = 12
 
@@ -111,25 +110,40 @@ function substantiveAnswers(turns: TranscriptTurn[]): number {
  * the caller decides whether that's enough to score, or whether the call was
  * abandoned (transcript may still be one-sided / empty).
  */
+interface TranscriptResult {
+  turns: TranscriptTurn[]
+  perceptionAnalysis?: string
+}
+
 async function pollTranscript(
   env: Env,
   ctx: JobContext,
   conversationId: string,
-): Promise<TranscriptTurn[]> {
+): Promise<TranscriptResult> {
   let turns: TranscriptTurn[] = []
+  let perceptionAnalysis: string | undefined
+  let transcriptReadyAt: number | undefined
   for (let attempt = 0; attempt < TRANSCRIPT_POLL_ATTEMPTS; attempt++) {
     if (ctx.signal.aborted) throw new Error('canceled')
-    const conversation = await callIntegration<unknown>(env, 'tavus/get-conversation', {
+    const conversation = await callTavus(env, 'get-conversation', {
       conversation_id: conversationId,
     })
     turns = extractTranscript(conversation)
-    if (substantiveAnswers(turns) > 0) return turns
+    perceptionAnalysis ??= extractPerceptionAnalysis(conversation)
+    if (substantiveAnswers(turns) > 0) {
+      transcriptReadyAt ??= attempt
+      // Raven commonly follows the transcript by a few seconds. Wait briefly
+      // for it, but never hold the report for the full transcript timeout.
+      if (perceptionAnalysis || attempt - transcriptReadyAt >= 6) {
+        return { turns, perceptionAnalysis }
+      }
+    }
 
     const pct = 0.1 + 0.3 * (attempt / TRANSCRIPT_POLL_ATTEMPTS)
     ctx.progress(pct, 'Waiting for the interview transcript…')
     await sleep(TRANSCRIPT_POLL_INTERVAL_MS, ctx.signal)
   }
-  return turns
+  return { turns, perceptionAnalysis }
 }
 
 // ── scoring ─────────────────────────────────────────────────────────────────
@@ -144,6 +158,7 @@ interface DetailResult {
   perQuestion: PerQuestionScore[]
   strengths: string[]
   weaknesses: string[]
+  nonVerbalFeedback?: string
   summary: string
 }
 
@@ -158,6 +173,7 @@ interface ScoreInput {
   problem?: string
   hintsUsed?: number
   totalHints?: number
+  perceptionAnalysis?: string
 }
 
 /** Coding-only: tell the scorer that leaning on hints should cost points. */
@@ -234,6 +250,9 @@ function userPromptFor(input: ScoreInput): string {
     problemBlock,
     'Interview transcript:',
     transcriptToText(input.turns),
+    input.perceptionAnalysis
+      ? `Raven end-of-call camera and delivery observation (use only as cautious coaching; do not infer personality, intent, health, protected traits, or hiring fitness):\n${input.perceptionAnalysis}`
+      : '',
     codeBlockFor(input),
   ]
     .filter(Boolean)
@@ -248,7 +267,7 @@ function userPromptFor(input: ScoreInput): string {
  */
 async function quickSummary(env: Env, ctx: JobContext, input: ScoreInput): Promise<QuickResult> {
   ctx.progress(0.45, 'Writing your summary…')
-  const ai = createDeepSpaceAI(env, 'anthropic')
+  const google = createGoogleGenerativeAI({ apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY })
   const system = [
     `You are an expert ${input.role} hiring manager. Give a fast first-impression grade of this mock interview.`,
     rubricFor(input.interviewType),
@@ -264,7 +283,7 @@ async function quickSummary(env: Env, ctx: JobContext, input: ScoreInput): Promi
     .join('\n')
 
   const { text } = await generateText({
-    model: ai(QUICK_MODEL),
+    model: google(REPORT_MODEL),
     system,
     prompt: userPromptFor(input),
     maxOutputTokens: 700,
@@ -287,7 +306,7 @@ async function quickSummary(env: Env, ctx: JobContext, input: ScoreInput): Promi
  */
 async function detailedFeedback(env: Env, ctx: JobContext, input: ScoreInput): Promise<DetailResult> {
   ctx.progress(0.7, 'Writing detailed feedback…')
-  const ai = createDeepSpaceAI(env, 'anthropic')
+  const google = createGoogleGenerativeAI({ apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY })
   const system = [
     `You are an expert ${input.role} hiring manager grading a candidate's mock interview transcript.`,
     'Be specific, fair, and constructive. Base every judgement only on what the candidate actually said or wrote.',
@@ -299,13 +318,15 @@ async function detailedFeedback(env: Env, ctx: JobContext, input: ScoreInput): P
     '  "perQuestion": [{ "question": string, "answer": string, "score": <integer 0-10>, "feedback": string, "betterAnswer": string }],',
     '  "strengths": [string, ...],',
     '  "weaknesses": [string, ...],',
+    '  "nonVerbalFeedback": string,',
     '  "summary": string',
     '}',
     "For each interviewer question, summarize the candidate answer, score it, give pointed feedback, and write a stronger sample answer in the candidate's voice.",
+    'Only provide nonVerbalFeedback when Raven supplied an observation. Keep it to 1-2 neutral, actionable sentences about camera presence or delivery; otherwise return an empty string.',
   ].join('\n')
 
   const { text } = await generateText({
-    model: ai(DETAIL_MODEL),
+    model: google(REPORT_MODEL),
     system,
     prompt: userPromptFor(input),
     maxOutputTokens: 4096,
@@ -316,6 +337,7 @@ async function detailedFeedback(env: Env, ctx: JobContext, input: ScoreInput): P
     perQuestion: Array.isArray(parsed.perQuestion) ? (parsed.perQuestion as PerQuestionScore[]) : [],
     strengths: toStringArray(parsed.strengths),
     weaknesses: toStringArray(parsed.weaknesses),
+    nonVerbalFeedback: typeof parsed.nonVerbalFeedback === 'string' ? parsed.nonVerbalFeedback.trim() || undefined : undefined,
     summary: typeof parsed.summary === 'string' ? parsed.summary : '',
   }
 }
@@ -428,7 +450,9 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
 
     // ── Phase 1: fast summary (skip if a partial report already exists) ──────
     if (!reportId) {
-      input.turns = await pollTranscript(env, ctx, conversationId)
+      const transcript = await pollTranscript(env, ctx, conversationId)
+      input.turns = transcript.turns
+      input.perceptionAnalysis = transcript.perceptionAnalysis
 
       // No real answers captured — the call was abandoned before it got going.
       // Retry while attempts remain (the transcript may still be materializing);
@@ -481,6 +505,7 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
         perQuestion: detail.perQuestion,
         strengths: detail.strengths,
         weaknesses: detail.weaknesses,
+        nonVerbalFeedback: detail.nonVerbalFeedback,
         summary: detail.summary || undefined,
         detailed: true,
       },

@@ -8,7 +8,7 @@ export default defineConfig({
   plugins: [
     react(),
     generouted(),
-    cloudflare(),
+    cloudflare({ inspectorPort: false }),
     // Runs the Rules of Hooks lint (see eslint.config.js) automatically, so
     // there's no separate step to remember: a violation surfaces as an overlay
     // during `deepspace dev` and fails the build during `deepspace deploy`.

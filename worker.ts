@@ -26,6 +26,7 @@ import { runJob } from './src/jobs.js'
 import { schemas } from './src/schemas.js'
 import { integrations } from './src/integrations.js'
 import { registerAiChatRoutes } from './src/ai/chat-routes.js'
+import { callTavus, type TavusOperation } from './src/lib/tavus-server.js'
 
 // =============================================================================
 // DO Manifest — declares all Durable Objects for dynamic deploy bindings
@@ -135,6 +136,10 @@ export interface Env extends DOBindings<typeof __DO_MANIFEST__> {
    * they are the JWT subject.
    */
   APP_OWNER_JWT: string
+  /** Tavus credential, stored as a server-side DeepSpace secret. */
+  TAVUS_API_KEY: string
+  /** Gemini credential, stored as a server-side DeepSpace secret. */
+  GOOGLE_GENERATIVE_AI_API_KEY: string
   /**
    * When set to "true", the app worker exposes /api/debug/* (set-role,
    * sql, query, records, status) by forwarding to the RecordRoom DO's
@@ -203,12 +208,15 @@ app.get('/api/auth/oauth-complete', async (c) => {
   const data = (await res.json()) as { sessionToken?: string }
   if (!data.sessionToken) return c.redirect(appOrigin)
   const sessionToken = data.sessionToken
+  const isSecure = new URL(c.req.url).protocol === 'https:'
+  const cookieName = isSecure ? '__Secure-better-auth.session_token' : 'better-auth.session_token'
+  const secureAttribute = isSecure ? '; Secure' : ''
 
   return new Response(null, {
     status: 302,
     headers: {
       Location: appOrigin,
-      'Set-Cookie': `__Secure-better-auth.session_token=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`,
+      'Set-Cookie': `${cookieName}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly${secureAttribute}; SameSite=Lax; Max-Age=2592000`,
     },
   })
 })
@@ -225,11 +233,15 @@ app.all('/api/auth/sign-out', async (c) => {
     // failure must not leave the browser immediately signed back in.
   }
 
+  const isSecure = new URL(c.req.url).protocol === 'https:'
+  const cookieName = isSecure ? '__Secure-better-auth.session_token' : 'better-auth.session_token'
+  const secureAttribute = isSecure ? '; Secure' : ''
+
   return new Response(JSON.stringify({ success: true }), {
     status: 200,
     headers: {
       'Content-Type': 'application/json',
-      'Set-Cookie': '__Secure-better-auth.session_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+      'Set-Cookie': `${cookieName}=; Path=/; HttpOnly${secureAttribute}; SameSite=Lax; Max-Age=0`,
     },
   })
 })
@@ -248,7 +260,17 @@ app.all('/api/auth/*', async (c) => {
   const headers = new Headers(res.headers)
   const setCookie = headers.get('set-cookie')
   if (setCookie) {
-    headers.set('set-cookie', setCookie.replace(/;\s*Domain=[^;]*/gi, ''))
+    const isSecure = new URL(c.req.url).protocol === 'https:'
+    let normalized = setCookie.replace(/;\s*Domain=[^;]*/gi, '')
+    // Safari correctly rejects `__Secure-` cookies over http://localhost.
+    // Keep production cookies strict, but make every sign-in path (OAuth and
+    // email/password) usable in the local HTTP dev server.
+    if (!isSecure) {
+      normalized = normalized
+        .replace(/__Secure-better-auth\.session_token/g, 'better-auth.session_token')
+        .replace(/;\s*Secure/gi, '')
+    }
+    headers.set('set-cookie', normalized)
   }
   return new Response(res.body, { status: res.status, headers })
 })
@@ -370,6 +392,35 @@ app.all('/api/integrations/:name/:endpoint', async (c) => {
     return new Response(res.body, { status: res.status, headers: res.headers })
   } catch {
     return c.json({ error: 'Integration proxy failed' }, 502)
+  }
+})
+
+// Tavus is not currently offered by DeepSpace's managed integration catalog.
+// Keep the credential in this worker and expose only the small, auth-gated
+// operation surface the interview UI needs.
+const tavusOperations = new Set<TavusOperation>([
+  'list-replicas',
+  'create-persona',
+  'create-conversation',
+  'get-conversation',
+  'end-conversation',
+])
+
+app.post('/api/tavus/:operation', async (c) => {
+  const auth = await resolveAuth(c.req.raw, c.env)
+  if (!auth) return c.json({ success: false, error: 'Sign in required' }, 401)
+
+  const operation = c.req.param('operation')
+  if (!tavusOperations.has(operation as TavusOperation)) {
+    return c.json({ success: false, error: 'Unsupported Tavus operation' }, 404)
+  }
+
+  try {
+    const params = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
+    const data = await callTavus(c.env, operation as TavusOperation, params)
+    return c.json({ success: true, data })
+  } catch (error) {
+    return c.json({ success: false, error: error instanceof Error ? error.message : 'Tavus request failed' }, 502)
   }
 })
 

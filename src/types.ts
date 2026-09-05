@@ -66,6 +66,8 @@ export interface Report {
   perQuestion?: PerQuestionScore[]
   strengths?: string[]
   weaknesses?: string[]
+  /** Optional Raven camera / delivery observations, phrased as coaching. */
+  nonVerbalFeedback?: string
   summary?: string
   /** false after the fast summary pass; true once the detailed breakdown lands. */
   detailed?: boolean

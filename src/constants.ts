@@ -1,5 +1,5 @@
 /** App name — replaced by the CLI during scaffolding */
-export const APP_NAME = 'mock-interview'
+export const APP_NAME = 'dialogue-interview-neel'
 
 /** Primary scope ID for the app's RecordRoom DO */
 export const SCOPE_ID = `app:${APP_NAME}`
