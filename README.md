@@ -6,6 +6,14 @@ Dialogue is a browser-based mock-interview platform for interview practice and c
 
 **Live application:** [dialogue-interview-neel.app.space](https://dialogue-interview-neel.app.space)
 
+## Product preview
+
+### Live interview workspace
+
+![Dialogue live interview workspace showing the Tavus interviewer, candidate camera, captions, and interview controls.](./docs/images/live-interview-ui.png)
+
+The interview stage combines the Dialogue controls with a Tavus conversational-video session. Candidates can speak naturally, use captions, and end the session when they are ready for feedback.
+
 <p align="center">
   <a href="https://www.tavus.io/" title="Tavus">
     <img src="https://cdn.prod.website-files.com/68c8e57d6e512b9573db146f/68fbd348e3cc27dfbff98c1e_models-birds.avif" alt="Tavus visual" width="720" />
@@ -46,6 +54,12 @@ flowchart LR
 | **Gemini 3.6 Flash** | Server-side fast summary and detailed report generation from the completed interview transcript. |
 
 ## Architecture
+
+### Why multimodal interview feedback matters
+
+![Architecture concept: human input contains visual perception, audio perception, intent, emotion, context, non-verbal cues, and transcript; an AI filter can lose signal richness.](./docs/images/conversational-ai-gap-architecture.png)
+
+The architecture uses the transcript as the core evidence for scoring and can add Tavus Raven camera and delivery observations as limited coaching context. This helps preserve useful conversational signals without treating them as a hiring decision.
 
 ```mermaid
 sequenceDiagram
