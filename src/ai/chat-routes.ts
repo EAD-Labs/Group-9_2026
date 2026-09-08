@@ -13,14 +13,13 @@
  */
 
 import type { Hono } from 'hono'
-import { streamText, stepCountIs } from 'ai'
+import { generateText, streamText, stepCountIs } from 'ai'
 import type { ModelMessage } from 'ai'
+import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import {
-  createDeepSpaceAI,
   prepareMessagesWithCompaction,
   turnsToCoreMessages,
   buildUiParts,
-  makeDefaultSummarizer,
   capToolResultSize,
   DEFAULT_CONTEXT_CONFIG,
   getChat,
@@ -39,36 +38,10 @@ import type { Env, AppContext } from '../../worker.js'
 
 type ResolveAuth = (req: Request, env: Env) => Promise<VerifyResult | null>
 
-// Allowlist of models the client may select. Keeps a malicious or stale
-// `modelId` from hitting the fallback pricing tier. Add models here as you
-// expose them in the UI. When adding a new model, test end-to-end first and
-// watch worker logs — reasoning/thinking models occasionally surface chunk
-// types we don't handle yet (we ignore them silently in `applyStreamAction`).
-//
-// IDs use stable aliases (`claude-opus-4-7`) rather than dated snapshots
-// (`claude-opus-4-7-20260101`) so a provider's bug-fix release lands here
-// without a code change. Pin to a snapshot if you need reproducible behavior.
-const ALLOWED_MODELS: Record<string, 'anthropic' | 'openai' | 'cerebras'> = {
-  // Anthropic — covers premium ($5/$25), balanced ($3/$15), cheap ($1/$5).
-  'claude-opus-4-7':    'anthropic',
-  'claude-sonnet-4-6':  'anthropic',
-  'claude-haiku-4-5':   'anthropic',
-  // OpenAI — chat-completions-compatible only. gpt-5.4-pro exists in the
-  // typed model union BUT is Responses-API-only (returns "not a chat model"
-  // on /v1/chat/completions). Same restriction applies to o1/o3 today; if
-  // we want them, the proxy needs Responses-API support. Until then keep
-  // the picker to chat-completions-compatible variants.
-  'gpt-5.4':            'openai',
-  'gpt-5.4-mini':       'openai',
-  'gpt-5.4-nano':       'openai',
-  // Cerebras — only `gpt-oss-120b` is on the production tier today
-  // (~3000 tok/s). `llama3.1-8b` deprecates 2026-05; preview models
-  // (qwen-3-235b, glm-4.7) are explicitly not for production use.
-  'gpt-oss-120b':       'cerebras',
-}
-// Sonnet 4.6 is the balanced default — capable enough for most tool-using
-// turns, ~3x cheaper than Opus, and the same 1M-token context.
-const DEFAULT_MODEL = 'claude-sonnet-4-6'
+// Keep the generic app-assistant route on the same server-side Gemini
+// provider as interview scoring and coding-problem generation.
+const ALLOWED_MODELS = { 'gemini-3.6-flash': true } as const
+const DEFAULT_MODEL = 'gemini-3.6-flash'
 
 function recordRoomStub(env: Env): DurableObjectStub {
   return env.RECORD_ROOMS.get(env.RECORD_ROOMS.idFromName(`app:${env.APP_NAME}`))
@@ -77,6 +50,22 @@ function recordRoomStub(env: Env): DurableObjectStub {
 // Cap on user-supplied content length. Far above any realistic message;
 // blocks accidental DoS via megabyte payloads.
 const MAX_USER_CONTENT_LENGTH = 100_000
+
+function makeGeminiSummarizer(env: Env) {
+  return async (messages: ChatTurn[]) => {
+    const transcript = messages
+      .map((message) => `${message.role === 'assistant' ? 'Assistant' : message.role === 'user' ? 'User' : 'System'}: ${message.content}`)
+      .join('\n\n')
+    const google = createGoogleGenerativeAI({ apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY })
+    const { text } = await generateText({
+      model: google(DEFAULT_MODEL),
+      system: 'Summarize this app-assistant conversation as terse factual notes for a future assistant. Preserve user goals, decisions, constraints, relevant IDs, and unfinished work. Keep it under 2,000 tokens.',
+      prompt: transcript,
+      maxOutputTokens: 2_500,
+    })
+    return text
+  }
+}
 
 // Derive a chat title from the first user message — first non-empty line,
 // trimmed to ~50 chars with an ellipsis.
@@ -143,10 +132,6 @@ export function registerAiChatRoutes(
     const auth = await resolveAuth(c.req.raw, c.env)
     if (!auth) return c.json({ error: 'Unauthorized' }, 401)
 
-    const authHeader = c.req.header('Authorization') ?? ''
-    const jwt = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
-    if (!jwt) return c.json({ error: 'Unauthorized' }, 401)
-
     const { chatId, userMessageId, content, modelId } = await c.req.json<{
       chatId?: string
       userMessageId?: string
@@ -163,7 +148,7 @@ export function registerAiChatRoutes(
     // DEFAULT_MODEL. Silent fallback used to hide drift between this
     // allowlist and ChatPanel's DEFAULT_MODELS picker — the dev would see
     // "always Sonnet" output with no clue why.
-    if (modelId !== undefined && !ALLOWED_MODELS[modelId]) {
+    if (modelId !== undefined && !Object.hasOwn(ALLOWED_MODELS, modelId)) {
       return c.json({ error: `Unknown modelId: ${modelId}` }, 400)
     }
 
@@ -208,8 +193,8 @@ export function registerAiChatRoutes(
       ? { text: chat.compactedSummary, throughId: chat.compactedThroughId }
       : undefined
 
-    // User-billed: compaction is part of the user's chat experience, not infra.
-    const summarizer = makeDefaultSummarizer(c.env, { authToken: jwt })
+    // Compaction uses the same Gemini server-side provider as the rest of the app.
+    const summarizer = makeGeminiSummarizer(c.env)
     const { messages: prepared, newSummary } = await prepareMessagesWithCompaction(
       turns,
       DEFAULT_CONTEXT_CONFIG,
@@ -224,7 +209,7 @@ export function registerAiChatRoutes(
 
     // modelId already validated above — fall back to default only when omitted.
     const usedModelId = modelId ?? DEFAULT_MODEL
-    const ai = createDeepSpaceAI(c.env, ALLOWED_MODELS[usedModelId], { authToken: jwt })
+    const google = createGoogleGenerativeAI({ apiKey: c.env.GOOGLE_GENERATIVE_AI_API_KEY })
     const baseSystem = buildSystemPrompt(c.env.APP_NAME, schemas)
 
     // Compaction inserts at most one summary system message at index 0; fold
@@ -261,7 +246,7 @@ export function registerAiChatRoutes(
     const asstId = `asst-${Date.now()}-${crypto.randomUUID()}`
 
     const result = streamText({
-      model: ai(usedModelId),
+      model: google(usedModelId),
       system: systemText,
       messages,
       tools,
@@ -342,7 +327,7 @@ export function registerAiChatRoutes(
         // the WebSocket-broadcast row is by id (clock-skew-proof).
         'X-Asst-Id': asstId,
       },
-      // Reasoning models (o-series, Claude with extended thinking) emit
+      // Reasoning-capable models can emit
       // `reasoning-start`/`reasoning-delta`/`reasoning-end` chunks. We
       // don't render them today — pass them through and the user sees a
       // stuck spinner during long thinks. Opt out at the boundary until

@@ -16,6 +16,8 @@
 
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { generateText } from 'ai'
+import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import { verifyJwt, apiWorkerFetch, platformWorkerFetch, authWorkerFetch } from 'deepspace/worker'
 import type { JwtVerifierConfig, VerifyResult } from 'deepspace/worker'
 import { RecordRoom, YjsRoom, CanvasRoom, PresenceRoom, CronRoom, JobRoom } from 'deepspace/worker'
@@ -405,6 +407,76 @@ const tavusOperations = new Set<TavusOperation>([
   'get-conversation',
   'end-conversation',
 ])
+
+const CODING_DIFFICULTY: Record<string, string> = {
+  intern: 'LeetCode EASY to lower-MEDIUM. One straightforward data structure; clean, direct logic.',
+  junior: 'LeetCode MEDIUM. One non-obvious insight or data-structure choice.',
+  mid: 'LeetCode HARD (a strong MEDIUM-HARD at the very easiest). A real algorithmic insight required.',
+  senior: 'LeetCode HARD. Requires the optimal approach and edge-case rigor.',
+  staff: 'LeetCode HARD, often multi-part or deliberately ambiguous. Requires the optimal approach and deep trade-off reasoning.',
+}
+
+const CODING_PATTERNS = [
+  'arrays & hashing', 'two pointers', 'sliding window', 'stack', 'binary search',
+  'linked lists', 'trees & BFS/DFS', 'graphs', 'heaps / priority queue', 'intervals',
+  'greedy', 'dynamic programming', 'backtracking', 'tries', 'matrix traversal',
+  'string manipulation', 'data-structure design (e.g. LRU cache)',
+]
+
+function parseGeneratedProblem(text: string): { title: string; statement: string; hints: string[] } {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  const body = fenced ? fenced[1] : text
+  const start = body.indexOf('{')
+  const end = body.lastIndexOf('}')
+  if (start === -1 || end === -1) throw new Error('Gemini returned no JSON coding problem.')
+  const parsed = JSON.parse(body.slice(start, end + 1)) as Record<string, unknown>
+  const hints = Array.isArray(parsed.hints)
+    ? parsed.hints.filter((hint): hint is string => typeof hint === 'string').slice(0, 3)
+    : []
+  return {
+    title: typeof parsed.title === 'string' ? parsed.title : 'Coding problem',
+    statement: typeof parsed.statement === 'string' ? parsed.statement : text.trim(),
+    hints,
+  }
+}
+
+/** Gemini gateway for coding-problem generation; the API key never reaches the browser. */
+app.post('/api/gemini/coding-problem', async (c) => {
+  const auth = await resolveAuth(c.req.raw, c.env)
+  if (!auth) return c.json({ success: false, error: 'Sign in required' }, 401)
+
+  try {
+    const body = (await c.req.json()) as { role?: unknown; difficulty?: unknown; jobDescription?: unknown }
+    const role = typeof body.role === 'string' ? body.role.trim().slice(0, 120) : ''
+    const difficulty = typeof body.difficulty === 'string' ? body.difficulty : ''
+    const jobDescription = typeof body.jobDescription === 'string' ? body.jobDescription.trim().slice(0, 12_000) : ''
+    if (!role || !CODING_DIFFICULTY[difficulty]) {
+      return c.json({ success: false, error: 'A role and valid difficulty are required' }, 400)
+    }
+
+    const focus = CODING_PATTERNS[Math.floor(Math.random() * CODING_PATTERNS.length)]
+    const system = [
+      `You are an interview problem-setter writing ONE coding question for a "${role}" candidate, in the exact style of a real LeetCode / big-tech phone-screen problem.`,
+      `DIFFICULTY — calibrate precisely to: ${CODING_DIFFICULTY[difficulty]}`,
+      `TOPIC — match it to the role and job description. Bias toward the pattern "${focus}" unless a different pattern clearly fits this role better. For data/analytics roles where the job description implies SQL, a SQL query problem is acceptable instead.`,
+      jobDescription ? `Tailor the framing/flavor to this job description:\n${jobDescription}` : 'No job description provided — pick a broadly relevant topic for the role.',
+      'Base it on a canonical interview-problem archetype, but write a clean, self-contained, original statement in your own words — do not cite a famous problem by name.',
+      'The statement MUST include a precise task, 1-2 worked examples with explicit input and output, and constraints. It should be solvable in about 20-30 minutes at the target difficulty.',
+      'Return ONLY a JSON object: { "title": string, "statement": string, "hints": [exactly 3 progressive short hints] }.',
+    ].join('\n')
+    const google = createGoogleGenerativeAI({ apiKey: c.env.GOOGLE_GENERATIVE_AI_API_KEY })
+    const { text } = await generateText({
+      model: google('gemini-3.6-flash'),
+      system,
+      prompt: 'Generate the problem now.',
+      maxOutputTokens: 1_500,
+      abortSignal: c.req.raw.signal,
+    })
+    return c.json({ success: true, data: parseGeneratedProblem(text) })
+  } catch (error) {
+    return c.json({ success: false, error: error instanceof Error ? error.message : 'Gemini problem generation failed' }, 502)
+  }
+})
 
 app.post('/api/tavus/:operation', async (c) => {
   const auth = await resolveAuth(c.req.raw, c.env)
