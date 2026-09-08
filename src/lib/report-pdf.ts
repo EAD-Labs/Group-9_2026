@@ -1,5 +1,5 @@
 import { jsPDF } from 'jspdf'
-import type { Interview, InterviewType, PerQuestionScore, Report, TranscriptTurn } from '../types'
+import type { Interview, InterviewType, PerQuestionScore, Report } from '../types'
 
 const PAGE_WIDTH = 595.28
 const PAGE_HEIGHT = 841.89
@@ -157,11 +157,6 @@ export function downloadReportPdf({ interview, report }: ReportPdfInput): void {
     paragraph(report.detailed ? 'No question-by-question breakdown was available.' : 'Detailed feedback was still being generated when this PDF was downloaded.')
   }
 
-  if (report.transcript?.length) {
-    heading('Interview transcript')
-    report.transcript.forEach((turn) => addTranscriptTurn(turn, paragraph))
-  }
-
   const total = doc.getNumberOfPages()
   for (let page = 1; page <= total; page++) {
     doc.setPage(page)
@@ -213,16 +208,4 @@ function addQuestion(
     paragraph('Stronger answer', { size: 9, color: [43, 101, 177], gap: 1 })
     paragraph(question.betterAnswer, { size: 10, color: [35, 70, 120], gap: 10 })
   }
-}
-
-function addTranscriptTurn(
-  turn: TranscriptTurn,
-  paragraph: (text: string, options?: { size?: number; color?: [number, number, number]; indent?: number; gap?: number }) => void,
-) {
-  const label = turn.speaker === 'candidate' ? 'Candidate' : 'Interviewer'
-  paragraph(`${label}: ${turn.text}`, {
-    size: 9,
-    color: turn.speaker === 'candidate' ? [38, 73, 123] : [83, 94, 108],
-    gap: 4,
-  })
 }
