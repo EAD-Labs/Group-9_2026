@@ -43,6 +43,7 @@
     "deepspace": "^0.6.2",
     "framer-motion": "^11.15.0",
     "hono": "^4.7.0",
+    "jspdf": "^4.2.1",
     "lucide-react": "^0.460.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

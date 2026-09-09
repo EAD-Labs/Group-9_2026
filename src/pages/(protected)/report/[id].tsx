@@ -13,6 +13,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Check,
+  Download,
   Loader2,
   Minus,
   MessageSquare,
@@ -161,7 +162,16 @@ function Centered({
 function ReportView({ interview, report }: { interview: Interview; report: Report }) {
   return (
     <div className="space-y-8">
-      <ScoreHeader interview={interview} report={report} pending={!report.detailed} />
+      <ScoreHeader
+        interview={interview}
+        report={report}
+        pending={!report.detailed}
+        onDownload={() => {
+          void import('../../../lib/report-pdf').then(({ downloadReportPdf }) => {
+            downloadReportPdf({ interview, report })
+          })
+        }}
+      />
 
       {(!!report.strengths?.length || !!report.weaknesses?.length) && (
         <div className="grid gap-4 sm:grid-cols-2">
@@ -235,16 +245,24 @@ function ScoreHeader({
   interview,
   report,
   pending,
+  onDownload,
 }: {
   interview: Interview
   report: Report
   pending?: boolean
+  onDownload: () => void
 }) {
   const answered = report.questionsAnswered
   const expected = report.expectedQuestions
   const partial = typeof answered === 'number' && typeof expected === 'number' && answered < expected
   return (
     <div className="rounded-3xl border border-border bg-card p-7 shadow-[0_20px_50px_-24px_rgba(0,0,0,0.7)]">
+      <div className="mb-4 flex justify-end">
+        <Button variant="outline" size="sm" onClick={onDownload}>
+          <Download className="mr-1.5 h-4 w-4" />
+          Download PDF
+        </Button>
+      </div>
       <div className="flex flex-col items-center gap-6 sm:flex-row sm:items-center">
         <ScoreRing score={report.overallScore} />
         <div className="min-w-0 flex-1 text-center sm:text-left">
