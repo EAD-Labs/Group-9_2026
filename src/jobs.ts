@@ -18,6 +18,13 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import type { Job, JobContext } from 'deepspace/worker'
 import type { Env } from '../worker'
 import { callTavus } from './lib/tavus-server'
+import { tavusKeyForConversation } from './lib/tavus-key-pool'
+import {
+  BEHAVIORAL_CRITERIA,
+  behavioralScore,
+  parseBehavioralRubric,
+  type BehavioralRubricRow,
+} from './lib/behavioral-rubric'
 import { EXPECTED_QUESTIONS } from './types'
 import type { InterviewType, PerQuestionScore, Report, TranscriptTurn } from './types'
 
@@ -119,6 +126,7 @@ async function pollTranscript(
   env: Env,
   ctx: JobContext,
   conversationId: string,
+  apiKey: string,
 ): Promise<TranscriptResult> {
   let turns: TranscriptTurn[] = []
   let perceptionAnalysis: string | undefined
@@ -127,7 +135,7 @@ async function pollTranscript(
     if (ctx.signal.aborted) throw new Error('canceled')
     const conversation = await callTavus(env, 'get-conversation', {
       conversation_id: conversationId,
-    })
+    }, apiKey)
     turns = extractTranscript(conversation)
     perceptionAnalysis ??= extractPerceptionAnalysis(conversation)
     if (substantiveAnswers(turns) > 0) {
@@ -152,6 +160,7 @@ interface QuickResult {
   overallScore: number
   questionsAnswered: number
   summary: string
+  behavioralRubric?: BehavioralRubricRow[]
 }
 
 interface DetailResult {
@@ -159,6 +168,7 @@ interface DetailResult {
   strengths: string[]
   weaknesses: string[]
   nonVerbalFeedback?: string
+  resumeFeedback?: string
   summary: string
 }
 
@@ -174,6 +184,9 @@ interface ScoreInput {
   hintsUsed?: number
   totalHints?: number
   perceptionAnalysis?: string
+  behavioralRubric?: BehavioralRubricRow[]
+  /** Candidate-supplied resume context, only when consent was recorded. */
+  resumeText?: string
 }
 
 /** Coding-only: tell the scorer that leaning on hints should cost points. */
@@ -247,6 +260,12 @@ function userPromptFor(input: ScoreInput): string {
       : ''
   return [
     input.jobDescription.trim() ? `Job description:\n${input.jobDescription.trim()}\n` : '',
+    input.resumeText?.trim()
+      ? `Candidate-provided resume context (the candidate explicitly opted in; use only for relevant, evidence-based coaching):\n${input.resumeText.trim()}\n`
+      : '',
+    input.behavioralRubric?.length
+      ? `The final behavioral grades have already been selected. Keep detailed feedback consistent with these rows; do not calculate a new overall score:\n${JSON.stringify(input.behavioralRubric)}\n`
+      : '',
     problemBlock,
     'Interview transcript:',
     transcriptToText(input.turns),
@@ -268,6 +287,42 @@ function userPromptFor(input: ScoreInput): string {
 async function quickSummary(env: Env, ctx: JobContext, input: ScoreInput): Promise<QuickResult> {
   ctx.progress(0.45, 'Writing your summary…')
   const google = createGoogleGenerativeAI({ apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY })
+  if (input.interviewType === 'behavioral') {
+    const anchors = BEHAVIORAL_CRITERIA.map((criterion) =>
+      `${criterion.id} (${criterion.label}): ${criterion.anchors.map((description, index) => `${index + 1}=${description}`).join(' | ')}`,
+    ).join('\n')
+    const system = [
+      'You are grading a behavioral mock interview using this fixed four-level rubric. Treat the transcript as evidence, not the resume as proof.',
+      'Return exactly one JSON object with questionsAnswered, summary, and seven rubric rows. Do not supply an overallScore; the application calculates it.',
+      'For each row choose grade 1, 2, 3, 4, or null if the candidate had no fair opportunity to demonstrate it.',
+      'Each graded row needs a short justification and a brief, specific piece of transcript or Raven evidence. A null row needs a justification and empty evidence.',
+      'A text transcript can establish wording and concision, but not pitch, volume, eye contact, or vocal pace. Do not claim to have observed those signals unless the supplied Raven analysis explicitly supports them.',
+      'Only grade visible engagement when Raven supplied an observable camera analysis. Camera off or no reliable observation means null. Do not infer emotion, personality, disability, protected traits, or hiring fitness from appearance.',
+      'Only grade candidate_questions if the interviewer invited questions or the candidate actually asked one. Otherwise use null; a short interview must not be penalized for an opportunity it never offered.',
+      'For preparation, assess demonstrated understanding of the role. Do not penalize missing company-specific facts when no company information was supplied.',
+      'Do not penalize a short timed session for answering fewer than a fixed number of questions. Judge the quality and relevance of the evidence that was available.',
+      'Before grading, identify the two or three most important behavioral competencies for this role and any supplied job description. Use that as an evaluation lens for relevance, stories, and preparation, but never invent company requirements or penalize a competency the interviewer did not give the candidate a fair chance to demonstrate.',
+      'Rubric anchors:\n' + anchors,
+      'JSON shape: {"questionsAnswered":number,"summary":string,"rubric":[{"id":string,"grade":1|2|3|4|null,"justification":string,"evidence":string}]}',
+    ].join('\n')
+    const { text } = await generateText({
+      model: google(REPORT_MODEL),
+      system,
+      prompt: userPromptFor(input),
+      maxOutputTokens: 3_200,
+      abortSignal: ctx.signal,
+    })
+    const parsed = parseJsonObject(text)
+    const behavioralRubric = parseBehavioralRubric(parsed.rubric, !!input.perceptionAnalysis)
+    return {
+      overallScore: behavioralScore(behavioralRubric),
+      questionsAnswered: Number.isFinite(Number(parsed.questionsAnswered))
+        ? Math.max(0, Math.round(Number(parsed.questionsAnswered)))
+        : 0,
+      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+      behavioralRubric,
+    }
+  }
   const system = [
     `You are an expert ${input.role} hiring manager. Give a fast first-impression grade of this mock interview.`,
     rubricFor(input.interviewType),
@@ -311,7 +366,9 @@ async function detailedFeedback(env: Env, ctx: JobContext, input: ScoreInput): P
     `You are an expert ${input.role} hiring manager grading a candidate's mock interview transcript.`,
     'Be specific, fair, and constructive. Base every judgement only on what the candidate actually said or wrote.',
     rubricFor(input.interviewType),
-    completenessRule,
+    input.interviewType === 'behavioral'
+      ? 'This is a short, timed behavioral interview. Do not expect a fixed number of questions; the overall grade is already determined by the evidence-based rubric.'
+      : completenessRule,
     hintNote(input),
     'Respond with a SINGLE JSON object and nothing else, matching exactly this shape:',
     '{',
@@ -319,10 +376,14 @@ async function detailedFeedback(env: Env, ctx: JobContext, input: ScoreInput): P
     '  "strengths": [string, ...],',
     '  "weaknesses": [string, ...],',
     '  "nonVerbalFeedback": string,',
+    '  "resumeFeedback": string,',
     '  "summary": string',
     '}',
     "For each interviewer question, summarize the candidate answer, score it, give pointed feedback, and write a stronger sample answer in the candidate's voice.",
     'Only provide nonVerbalFeedback when Raven supplied an observation. Keep it to 1-2 neutral, actionable sentences about camera presence or delivery; otherwise return an empty string.',
+    input.resumeText?.trim()
+      ? 'Provide resumeFeedback as 1-2 neutral, evidence-based coaching sentences that connect what the candidate said in the interview to skills or experience they stated in the opted-in resume. Never infer protected or personal characteristics, and do not treat a resume claim as proof. If the transcript does not support a useful connection, return an empty string.'
+      : 'Return an empty string for resumeFeedback because no resume context was supplied.',
   ].join('\n')
 
   const { text } = await generateText({
@@ -338,6 +399,7 @@ async function detailedFeedback(env: Env, ctx: JobContext, input: ScoreInput): P
     strengths: toStringArray(parsed.strengths),
     weaknesses: toStringArray(parsed.weaknesses),
     nonVerbalFeedback: typeof parsed.nonVerbalFeedback === 'string' ? parsed.nonVerbalFeedback.trim() || undefined : undefined,
+    resumeFeedback: typeof parsed.resumeFeedback === 'string' ? parsed.resumeFeedback.trim() || undefined : undefined,
     summary: typeof parsed.summary === 'string' ? parsed.summary : '',
   }
 }
@@ -410,6 +472,8 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
         problem?: string
         hints?: string[]
         hintsUsed?: number
+        resumeText?: string
+        resumeFollowupConsent?: boolean
       }>
     }>(env, env.OWNER_USER_ID || 'system', 'records.get', {
       collection: 'interviews',
@@ -428,6 +492,7 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
       problem: interview.data.problem,
       hintsUsed: interview.data.hintsUsed,
       totalHints: interview.data.hints?.length,
+      resumeText: interview.data.resumeFollowupConsent ? interview.data.resumeText : undefined,
     }
 
     // Idempotent across retries: if a (partial) report already exists, reuse
@@ -447,10 +512,12 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
 
     let reportId = existing?.recordId
     input.turns = (existing?.data.transcript as TranscriptTurn[] | undefined) ?? []
+    input.behavioralRubric = existing?.data.behavioralRubric
 
     // ── Phase 1: fast summary (skip if a partial report already exists) ──────
     if (!reportId) {
-      const transcript = await pollTranscript(env, ctx, conversationId)
+      const apiKey = await tavusKeyForConversation(env, conversationId)
+      const transcript = await pollTranscript(env, ctx, conversationId, apiKey)
       input.turns = transcript.turns
       input.perceptionAnalysis = transcript.perceptionAnalysis
 
@@ -479,7 +546,8 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
         transcript: input.turns,
         overallScore: quick.overallScore,
         questionsAnswered: quick.questionsAnswered,
-        expectedQuestions: EXPECTED_QUESTIONS,
+        expectedQuestions: input.interviewType === 'behavioral' ? undefined : EXPECTED_QUESTIONS,
+        behavioralRubric: quick.behavioralRubric,
         summary: quick.summary,
         detailed: false,
       }
@@ -506,6 +574,7 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
         strengths: detail.strengths,
         weaknesses: detail.weaknesses,
         nonVerbalFeedback: detail.nonVerbalFeedback,
+        resumeFeedback: detail.resumeFeedback,
         summary: detail.summary || undefined,
         detailed: true,
       },
