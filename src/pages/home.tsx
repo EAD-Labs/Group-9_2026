@@ -8,10 +8,13 @@ import { Link, useNavigate } from 'react-router-dom'
 import { AuthOverlay, useAuth, useMutations, useQuery, type RecordData } from 'deepspace'
 import AccountControl from '../components/AccountControl'
 import { fetchInterviewers, type InterviewerOption } from '../lib/tavus'
+import { extractResumeText } from '../lib/resume'
 import {
   ArrowRight,
   ArrowUpRight,
   Code2,
+  FileText,
+  Loader2,
   MessagesSquare,
   Mic,
   Network,
@@ -20,6 +23,7 @@ import {
 } from 'lucide-react'
 import {
   Button,
+  Checkbox,
   ConfirmModal,
   EmptyState,
   Input,
@@ -171,6 +175,11 @@ function NewInterviewForm() {
   const [interviewType, setInterviewType] = useState<InterviewType>('behavioral')
   const [difficulty, setDifficulty] = useState<Difficulty>('mid')
   const [jobDescription, setJobDescription] = useState('')
+  const [resumeText, setResumeText] = useState('')
+  const [resumeFileName, setResumeFileName] = useState('')
+  const [resumeConsent, setResumeConsent] = useState(false)
+  const [resumeParsing, setResumeParsing] = useState(false)
+  const [resumeError, setResumeError] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
 
   const [interviewers, setInterviewers] = useState<InterviewerOption[] | null>(null)
@@ -193,6 +202,25 @@ function NewInterviewForm() {
 
   const canStart = role.trim().length > 1 && !creating
 
+  async function handleResumeChange(file?: File) {
+    setResumeConsent(false)
+    setResumeError(null)
+    setResumeText('')
+    setResumeFileName('')
+    if (!file) return
+
+    setResumeParsing(true)
+    try {
+      const text = await extractResumeText(file)
+      setResumeText(text)
+      setResumeFileName(file.name)
+    } catch (err) {
+      setResumeError(err instanceof Error ? err.message : 'Could not read that resume.')
+    } finally {
+      setResumeParsing(false)
+    }
+  }
+
   async function handleStart() {
     if (!canStart) return
     setCreating(true)
@@ -202,10 +230,18 @@ function NewInterviewForm() {
         userId: '', // stamped server-side (userBound)
         role: role.trim(),
         interviewType,
+        durationMinutes: 5,
         difficulty,
         replicaId: chosen?.id,
         replicaName: chosen?.name,
         jobDescription: jobDescription.trim() || undefined,
+        ...(resumeText && resumeConsent
+          ? {
+              resumeText,
+              resumeFileName,
+              resumeFollowupConsent: true,
+            }
+          : {}),
         status: 'created',
       })
       navigate(`/interview/${id}`)
@@ -321,6 +357,18 @@ function NewInterviewForm() {
         </div>
 
         <div className="space-y-2.5">
+          <Label>Interview length</Label>
+          <div className="rounded-xl border border-primary/40 bg-primary/10 px-4 py-3 text-sm font-medium text-foreground">
+            5 minutes
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            {interviewType === 'behavioral'
+              ? 'The interviewer prioritizes role-specific examples and follow-ups before the five-minute call limit.'
+              : 'This is a brief practice session; the call ends after five minutes.'}
+          </p>
+        </div>
+
+        <div className="space-y-2.5">
           <Label htmlFor="jd">
             Job description <span className="font-normal text-muted-foreground">— optional</span>
           </Label>
@@ -331,6 +379,50 @@ function NewInterviewForm() {
             onChange={(e) => setJobDescription(e.target.value)}
             rows={5}
           />
+        </div>
+
+        <div className="space-y-2.5">
+          <Label htmlFor="resume">
+            Resume <span className="font-normal text-muted-foreground">— optional</span>
+          </Label>
+          <label
+            htmlFor="resume"
+            className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-border bg-card/40 px-4 py-3 text-sm transition-colors hover:border-primary/40 hover:bg-card"
+          >
+            {resumeParsing ? (
+              <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+            ) : (
+              <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+            )}
+            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+              {resumeFileName || 'Choose a PDF or .txt resume'}
+            </span>
+            <span className="text-xs font-medium text-primary">Browse</span>
+          </label>
+          <input
+            id="resume"
+            type="file"
+            accept="application/pdf,.pdf,text/plain,.txt"
+            className="sr-only"
+            onChange={(event) => void handleResumeChange(event.target.files?.[0])}
+          />
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            The original file stays on this device. We extract its text locally; it is not used or saved unless you opt in below.
+          </p>
+          {resumeError && <p className="text-xs text-destructive">{resumeError}</p>}
+          {resumeText && !resumeParsing && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-primary/25 bg-primary/5 px-3.5 py-3">
+              <Checkbox
+                id="resume-consent"
+                checked={resumeConsent}
+                onCheckedChange={(checked) => setResumeConsent(checked === true)}
+                className="mt-0.5"
+              />
+              <Label htmlFor="resume-consent" className="cursor-pointer text-xs font-normal leading-relaxed text-foreground">
+                I allow the AI interviewer and feedback report to use this resume for tailored questions, follow-ups, and coaching.
+              </Label>
+            </div>
+          )}
         </div>
 
         <Button
