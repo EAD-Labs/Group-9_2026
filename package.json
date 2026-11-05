@@ -3,11 +3,14 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "deepspace dev",
+    "dev": "npx --yes deepspace@latest dev start",
     "build": "vite build",
     "preview": "vite preview",
-    "login": "deepspace login",
-    "deploy": "deepspace deploy",
+    "login": "npx --yes deepspace@latest auth login",
+    "deploy": "npx --yes deepspace@latest deploy",
+    "setup:deploy": "bash scripts/setup-deploy.sh",
+    "deploy:app": "bash scripts/redeploy.sh",
+    "tavus:keys": "bash scripts/configure-tavus-keys.sh",
     "undeploy": "deepspace undeploy",
     "add": "deepspace add",
     "test": "deepspace test",
@@ -15,6 +18,7 @@
     "test:api": "deepspace test api",
     "test:e2e": "deepspace test e2e",
     "test:unit": "vitest run --passWithNoTests",
+    "test:deploy-setup": "node --test scripts/configure-deployment.test.mjs",
     "test:watch": "vitest",
     "screenshot": "deepspace screenshot",
     "type-check": "tsc --noEmit",
@@ -24,6 +28,7 @@
     "@ai-sdk/google": "^2.0.96",
     "@ai-sdk/openai": "^2.0.0",
     "@ai-sdk/openai-compatible": "^1.0.0",
+    "@daily-co/daily-js": "^0.92.2",
     "@generouted/react-router": "^1.20.0",
     "@radix-ui/react-avatar": "^1.1.0",
     "@radix-ui/react-checkbox": "^1.1.0",
@@ -45,6 +50,7 @@
     "hono": "^4.7.0",
     "jspdf": "^4.2.1",
     "lucide-react": "^0.460.0",
+    "pdfjs-dist": "^5.6.205",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router": "^7.1.0",
@@ -54,6 +60,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@ai-sdk/anthropic": "^2.0.107",
     "@cloudflare/vite-plugin": "^1.33.0",
     "@cloudflare/workers-types": "^4.20250109.0",
     "@playwright/test": "^1.50.0",
@@ -68,7 +75,7 @@
     "typescript-eslint": "^8.60.1",
     "vite": "^8.0.0",
     "vite-plugin-checker": "^0.14.1",
-    "vitest": "^3.0.0",
+    "vitest": "^4.1.11",
     "wrangler": "^4.79.0"
   },
   "private": true
